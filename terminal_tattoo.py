@@ -14,22 +14,27 @@ from sys import exit
 import pprint
 import re
 
+### SOME REASONABLE DEFAULTS
 DEFAULT_FONT = '/System/Library/Fonts/Menlo.ttc'
 DEFAULT_SIZE = 45
 DEFAULT_POS  = 'tR' # top right corner
 DEFAULT_FGC  = 'fK' # black
 DEFAULT_BGC  = 'bW' # white
 
+### I USE THESE IN A BUNCH OF PLACES AND I DON'T WANT TO KEEP TYPING IT
 POSITION_CODES = ['pT', 'pTL', 'pTR', 'pB', 'pBL', 'pBR', 'pC', 'pL', 'pR']
 
+### EMPIRICAL LINEAR TRANSFORMATION FROM CHARACTER GRID TO PIXELS
 RETINA_HCELL_PIXELS = 14
 RETINA_VCELL_PIXELS = 28
 RETINA_H_OFFSET     = 20
 RETINA_V_OFFSET     = 14
 
+### EXIT CODES
 EXIT_INVALID_FG   = -1
 EXIT_INVALID_BG   = -2
 EXIT_DOES_NOT_FIT = -3
+EXIT_CATASTROPHIC_ERROR = -10
 
 ##############################################################################
 # logging stuff:
@@ -157,18 +162,78 @@ def main():
     alpha = check_alpha(args)
     margin = check_margin(args)
 
-    render_bg_image = create_image(w, h, html_to_888(bg_color))
+    render_base_image = create_image(w, h, rgb_to_rgba(html_to_888(bg_color), 255))
     render_font = create_font(font, size)
     (render_text_width, render_text_height) = get_text_dimensions(render_font, text)
 
     if not fit_check(render_text_width, render_text_height, margin, w, h):
         exit(EXIT_DOES_NOT_FIT)
 
+    anchor = get_text_anchor_pos(position, render_text_width, render_text_height, render_base_image.size[0], render_base_image.size[1], margin)
+    render_comp = composite_text(render_base_image, text, render_font, anchor, rgb_to_rgba(html_to_888(fg_color), alpha))
+    render_comp.save(out_path)
+
     return
 
 ##############################################################################
-# other functions:
+# rendering functions:
 ##############################################################################
+
+def create_font(font_name, size):
+    return ImageFont.truetype(font_name, size)
+
+def create_image(w, h, blanking_color):
+    image = Image.new('RGBA', (w, h), blanking_color)
+    return image
+
+def composite_text(base_image, text, font_obj, anchor, color_rgba):
+    text_img = Image.new('RGBA', base_image.size, (255,255,255,0))
+    drawing = ImageDraw.Draw(text_img)
+    drawing.text(anchor, text, font=font_obj, fill=color_rgba)
+    ret = Image.alpha_composite(base_image, text_img)
+    return ret
+
+##############################################################################
+# help, sanitize, re-format, safety:
+##############################################################################
+
+def rgb_to_rgba(rgb, a):
+    return (rgb[0], rgb[1], rgb[2], a)
+
+def fit_check(render_text_width, render_text_height, margin, w, h):
+    m2 = 2 * margin
+    if h >= render_text_height + m2 and w >= render_text_width + m2:
+        return True
+    if h >= render_text_height + margin and w >= render_text_width + margin:
+        Logger.warning("this text just barely fits")
+        return True
+    return False
+
+def get_terminal_dimensions():
+    ts = get_terminal_size()
+    columns = ts.columns
+    lines = ts.lines
+    Logger.debug("terminal character cell dimensions measured at ({}, {})".format(columns, lines))
+    return (columns, lines)
+
+def get_terminal_pixel_size(columns, lines, h_pix, v_pix, h_offset=0, v_offset=0):
+    height = lines * v_pix + v_offset
+    width = columns * h_pix + h_offset
+    Logger.info("terminal dimensions: width: {} height: {}".format(width, height))
+    return (width, height)
+
+def sanitize_html_color(code):
+    m = re.match(r'[#]?([0-9a-fA-F]{6})', code)
+    Logger.debug("santized html code {} to {}".format(code, m.group(1)))
+    return m.group(1)
+
+def validate_html_color(color):
+    ret = False
+    pattern = r'[#]?[0-9a-fA-F]{6}'
+    m = re.search(pattern, color)
+    if m.group(0) == color:
+        ret = True
+    return ret
 
 def html_to_888(html_str):
     pat = r'(?P<red>[0-9a-fA-F]{2})(?P<green>[0-9a-fA-F]{2})(?P<blue>[0-9a-fA-F]{2})'
@@ -187,48 +252,74 @@ def get_text_dimensions(font_obj, text):
     Logger.debug("measured size of text (\'{}\') is ({}, {})".format(text, w, h))
     return (w, h)
 
-def get_text_anchor_pos(pos, text_w, text_h, image_w, image_h):
+def get_text_anchor_pos(pos, text_w, text_h, image_w, image_h, margin=0):
     """the text anchor is (by default in ImageFont) the top left corner of the
     bounding box. I see no reason to change this. The math is trivial when we
     know the desired text location in the image, the image width and height,
     and the text width and height."""
+    anchor_x = 0
+    anchor_y = 0
+    (centered_x, centered_y) = center_nested_frames(image_w, image_h, text_w, text_h)
+    far_x = image_w - (margin + text_w)
+    far_y = image_h - (margin + text_h)
+    if pos == 'pTL':
+        # top left corner: just apply margins
+        anchor_x = margin
+        anchor_y = margin
+    elif pos == 'pT':
+        # top center: margin in y, centered text in x
+        anchor_x = centered_x
+        anchor_y = margin
+    elif pos == 'pTR':
+        # top right corner: image_w - (margin + text_w), margin in y
+        anchor_x = far_x
+        anchor_y = margin
+    elif pos == 'pR':
+        # right center: image_w - (margin + text_w), center in y
+        anchor_x = far_x
+        anchor_y = centered_y
+    elif pos == 'pBR':
+        # bottom right corner: image_w - (margin + text_w), image_h - (margin + text_h)
+        anchor_x = far_x
+        anchor_y = far_y
+    elif pos == 'pB':
+        # bottom center: center in x, image_h - (margin + text_h) in y
+        anchor_x = centered_x
+        anchor_y = far_y
+    elif pos == 'pBL':
+        # bottom left corner: margin in x, image_ - (margin + text_h) in y
+        anchor_x = margin
+        anchor_y = far_y
+    elif pos == 'pL':
+        # left center: margin in x, center in y
+        anchor_x = margin
+        anchor_y = centered_y
+    elif pos == 'pC':
+        # centered: center in x, center in y
+        anchor_x = centered_x
+        anchor_y = centered_y
+    else:
+        raise RuntimeError("Not sure how we got here, but this isn't a valid position {}".format(pos))
+        exit(EXIT_CATASTROPHIC_ERROR)
+    return (anchor_x, anchor_y)
 
-    return
+def center_nested_frames(outer_w, outer_h, inner_w, inner_h):
+    # we can ignore the margin since it's symmetric, however other
+    # checks are still needed to ensure the margin isn't violated.
+    w = (outer_w / 2) - (inner_w / 2)
+    h = (outer_h / 2) - (inner_h / 2)
+    return (w, h)
 
-def check_margin(args):
-    return
 
-def create_font(font_name, size):
-    return ImageFont.truetype(font_name, size)
-
-def create_image(w, h, blanking_color):
-    image = Image.new('RGBA', (w, h), blanking_color)
-    return image
-
-def composite_text():
-    return
-
-def fit_check(render_text_width, render_text_height, margin, w, h):
-    return
-
-def get_terminal_dimensions():
-    ts = get_terminal_size()
-    columns = ts.columns
-    lines = ts.lines
-    Logger.debug("terminal character cell dimensions measured at ({}, {})".format(columns, lines))
-    return (columns, lines)
-
-def get_terminal_pixel_size(columns, lines, h_pix, v_pix, h_offset=0, v_offset=0):
-    height = lines * v_pix + v_offset
-    width = columns * h_pix + h_offset
-    Logger.info("terminal dimensions: width: {} height: {}".format(width, height))
-    return (width, height)
+##############################################################################
+# input validation functions:
+##############################################################################
 
 def check_position(args):
     ret = DEFAULT_POS
     position_args = POSITION_CODES
     for p in position_args:
-        if p in args:
+        if p in args and getattr(args, p) == True:
             ret = p
             break
     Logger.info("position will be {}".format(ret))
@@ -238,14 +329,14 @@ def check_fg_color(args):
     ret = DEFAULT_FGC
     skip_iter = False
     if args.f is not None:
-        if validate_html_color(args.b):
-            Logger.debug("the detected bg color is {}".format(args.b))
-            ret = args.b
+        if validate_html_color(args.f):
+            Logger.debug("the detected bg color is {}".format(args.f))
+            ret = args.f
         else:
             Logger.error("invalid bg color format given, a 6-digit hex value is required (HTML format)")
             exit(EXIT_INVALID_FG)
     color_args = ['f', 'fR', 'fG', 'fB', 'fW', 'fK', 'fC', 'fM', 'fY', 'fg']
-    color_in_hex = {'fR': 'FF0000', 'fG': '00FF00', 'ff': '0000FF', 'fW': 'FFFFFF', 'fK': '000000', 'fC': '00FFFF', 'fM': 'FF00ff', 'fY': 'FFFF00', 'fg': 'A9A9A9'}
+    color_in_hex = {'fR': 'FF0000', 'fG': '00FF00', 'fB': '0000FF', 'fW': 'FFFFFF', 'fK': '000000', 'fC': '00FFFF', 'fM': 'FF00ff', 'fY': 'FFFF00', 'fg': 'A9A9A9'}
     if not skip_iter:
         for color in color_args:
             if getattr(args, color) == True:
@@ -288,18 +379,20 @@ def check_alpha(args):
         Logger.info("alpha will be {}".format(a))
     return a
 
-def validate_html_color(color):
-    ret = False
-    pattern = r'[#]?[0-9a-fA-F]{6}'
-    m = re.search(pattern, color)
-    if m.group(0) == color:
-        ret = True
+def check_margin(args):
+    ret = args.margin
+    if ret is None:
+        return 0
+    MAX = 500
+    if ret < 0:
+        ret = 0
+        Logger.info("clamping margin to 0")
+    elif ret > MAX:
+        ret = MAX
+        Logger.info("clamping margin to {}} (what are you doing?)".format(MAX))
+    else:
+        Logger.info("margin will be {}".format(ret))
     return ret
-
-def sanitize_html_color(code):
-    m = re.match(r'[#]?([0-9a-fA-F]{6})', code)
-    Logger.debug("santized html code {} to {}".format(code, m.group(1)))
-    return m.group(1)
 
 def check_output_file(args):
     if not args.out_path:
@@ -332,11 +425,16 @@ def check_size(args):
     Logger.info("text will be point size {}".format(ret))
     return ret
 
+
+##############################################################################
+# argparse:
+##############################################################################
+
 def config_parser():
     parser = argparse.ArgumentParser(description='Render an image for a watermarked Terminal window.', \
         epilog='Defaults to {}, size {}, black text on white, positioned in the top right corner.'.format(path.basename(DEFAULT_FONT), DEFAULT_SIZE))
     parser.add_argument('text', type=str, nargs='+', help='Text to use in the watermark')
-    parser.add_argument('-s', metavar='SIZE', type=int, help='point size of the text')
+    parser.add_argument('-s', metavar='POINTS', type=int, help='point size of the text')
     parser.add_argument('--font', metavar='PATH', help='font to use for the watermark')
     parser.add_argument('--verbose', '-v', action='count', help='verbose mode (can be repeated)', default=0)
     parser.add_argument('-o', metavar='PATH', dest='out_path', help='output file for the rendered image')
@@ -353,7 +451,7 @@ def config_parser():
     position.add_argument('--pL',  action='store_true', help='left center')
     position.add_argument('--pR',  action='store_true', help='right center')
 
-    parser.add_argument('--margin', default=25, help='no-text perimeter width')
+    parser.add_argument('--margin', type=int, metavar='PIXELS', default=25, help='no-text perimeter width')
 
     fgColor = parser.add_mutually_exclusive_group()
     fgColor.add_argument('--fR', action='store_true', help='red')
@@ -365,7 +463,7 @@ def config_parser():
     fgColor.add_argument('--fM', action='store_true', help='magenta')
     fgColor.add_argument('--fY', action='store_true', help='yellow')
     fgColor.add_argument('--fg', action='store_true', help='medium gray')
-    fgColor.add_argument('--f', metavar='NNNNNN', help='arbitrary color in HTML format')
+    fgColor.add_argument('--f', metavar='RRGGBB', help='arbitrary color in HTML format')
 
     bgColor = parser.add_mutually_exclusive_group()
     bgColor.add_argument('--bR', action='store_true', help='red')
@@ -377,9 +475,10 @@ def config_parser():
     bgColor.add_argument('--bM', action='store_true', help='magenta')
     bgColor.add_argument('--bY', action='store_true', help='yellow')
     bgColor.add_argument('--bg', action='store_true', help='medium gray')
-    bgColor.add_argument('--b', metavar='NNNNNN', help='arbitrary color in HTML format')
+    bgColor.add_argument('--b', metavar='RRGGBB', help='arbitrary color in HTML format')
 
     return parser
+
 
 if __name__ == '__main__':
     main()
